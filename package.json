@@ -1,0 +1,56 @@
+{
+  "name": "@the-handover/sdk",
+  "version": "0.1.0",
+  "description": "Human-in-the-loop approval SDK for AI agents",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./langchain": {
+      "import": "./dist/integrations/langchain.js",
+      "types": "./dist/integrations/langchain.d.ts"
+    },
+    "./openai": {
+      "import": "./dist/integrations/openai.js",
+      "types": "./dist/integrations/openai.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "human-in-the-loop",
+    "approval",
+    "hitl"
+  ],
+  "author": "The Handover <hello@thehandover.xyz>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/the-handover/typescript-sdk"
+  },
+  "homepage": "https://thehandover.xyz",
+  "peerDependencies": {
+    "@langchain/core": ">=0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@langchain/core": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@langchain/core": "^1.1.40",
+    "typescript": "^6.0.2",
+    "zod": "^4.3.6"
+  }
+}
