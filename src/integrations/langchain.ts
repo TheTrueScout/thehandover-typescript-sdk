@@ -17,7 +17,7 @@
  * ```
  */
 
-import { StructuredTool, ToolInputParsingException } from '@langchain/core/tools';
+import { StructuredTool } from '@langchain/core/tools';
 import { z } from 'zod';
 import type { HandoverClient } from '../client.js';
 import type { ResponseTypeConfig } from '../types.js';
@@ -43,7 +43,8 @@ export class HandoverApprovalTool extends StructuredTool {
   description =
     'Request human approval before taking a sensitive action. ' +
     'Call this BEFORE executing any action that could be destructive, costly, or irreversible. ' +
-    'Returns APPROVED or MODIFIED with instructions. Raises an error if DENIED.';
+    'Returns APPROVED or MODIFIED with instructions. Returns a DENIED string if refused — ' +
+    'you MUST NOT proceed in that case.';
   schema = ApprovalSchema;
 
   private client: HandoverClient;
@@ -94,15 +95,15 @@ export class HandoverApprovalTool extends StructuredTool {
       return `APPROVED by ${decision.resolved_by}. You may proceed with: ${input.action}`;
     } catch (err) {
       if (err instanceof DecisionDenied) {
-        throw new ToolInputParsingException(
+        return (
           `DENIED: The human approver denied this action: ${input.action}. ` +
-          `You must NOT proceed with this action.`
+          `You MUST NOT proceed with this action under any circumstances.`
         );
       }
       if (err instanceof DecisionExpired) {
-        throw new ToolInputParsingException(
+        return (
           `EXPIRED: The approval request timed out for: ${input.action}. ` +
-          `You must NOT proceed without approval.`
+          `You MUST NOT proceed without explicit approval.`
         );
       }
       throw err;

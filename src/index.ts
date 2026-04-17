@@ -6,6 +6,7 @@ export type {
   DecisionStatus,
   Urgency,
   ResponseTypeConfig,
+  ResponseTypeName,
   ChooseResponse,
   TextInputResponse,
   TextInputField,
@@ -13,7 +14,12 @@ export type {
   ConfirmResponse,
   ApproveDenyResponse,
   ScheduleResponse,
+  FileUploadResponse,
+  Attachment,
+  ApprovalPolicy,
+  AmountRule,
   CreateDecisionOptions,
   CreateDecisionResult,
   ApproveOptions,
 } from './types.js';
+export { DEFAULT_KEYWORDS, DEFAULT_POLICY } from './types.js';

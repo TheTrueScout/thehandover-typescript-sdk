@@ -1,10 +1,53 @@
 import type {
+  Attachment,
   CreateDecisionOptions,
   CreateDecisionResult,
   Decision,
   ApproveOptions,
+  ApprovalPolicy,
+  Urgency,
 } from './types.js';
 import { HandoverError, DecisionDenied, DecisionExpired, DecisionTimeout } from './errors.js';
+
+interface ApiErrorBody {
+  error?: string;
+  code?: string;
+}
+
+interface AttachmentsResponse {
+  attachments: Attachment[];
+}
+
+const URGENCY_RANK: Record<string, number> = { low: 0, medium: 1, high: 2, critical: 3 };
+
+function policyRequires(
+  policy: ApprovalPolicy,
+  action: string,
+  urgency: string,
+  amount?: number,
+): boolean {
+  if (policy.never_require) return false;
+  if (policy.always_require) return true;
+  const actionLower = action.toLowerCase();
+  for (const kw of policy.require_for_keywords ?? []) {
+    if (actionLower.includes(kw.toLowerCase())) return true;
+  }
+  if (policy.require_for_urgency !== undefined) {
+    const threshold = URGENCY_RANK[policy.require_for_urgency] ?? 0;
+    if ((URGENCY_RANK[urgency] ?? 1) >= threshold) return true;
+  }
+  if (amount !== undefined) {
+    for (const rule of policy.amount_rules ?? []) {
+      if (amount >= rule.threshold) {
+        const kws = rule.keywords ?? [];
+        if (kws.length === 0 || kws.some(kw => actionLower.includes(kw.toLowerCase()))) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
 
 const DEFAULT_BASE_URL = 'https://thehandover.xyz';
 
@@ -16,6 +59,7 @@ export interface HandoverClientOptions {
   apiKey: string;
   baseUrl?: string;
   timeout?: number;
+  policy?: ApprovalPolicy;
 }
 
 /**
@@ -40,11 +84,13 @@ export class HandoverClient {
   private apiKey: string;
   private baseUrl: string;
   private timeout: number;
+  private policy?: ApprovalPolicy;
 
   constructor(options: HandoverClientOptions) {
     this.apiKey = options.apiKey;
     this.baseUrl = (options.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.timeout = options.timeout || 30000;
+    this.policy = options.policy;
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -57,17 +103,18 @@ export class HandoverClient {
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'the-handover-typescript/0.1.0',
+          'User-Agent': 'the-handover-typescript/0.2.0',
         },
         body: body ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
 
-      const data = await res.json() as Record<string, unknown>;
+      const data = await res.json() as unknown;
 
       if (!res.ok) {
+        const errorBody = data as ApiErrorBody;
         throw new HandoverError(
-          `API error ${res.status}: ${(data as any).error || res.statusText}`
+          `API error ${res.status}: ${errorBody.error || res.statusText}`
         );
       }
 
@@ -95,8 +142,70 @@ export class HandoverClient {
     if (options.options) body.options = options.options;
     if (options.callback_url) body.callback_url = options.callback_url;
     if (options.response_type) body.response_type = options.response_type;
+    if (options.context_images) body.context_images = options.context_images;
+    if (options.enforce) body.enforce = true;
 
     return this.request<CreateDecisionResult>('POST', '/decisions', body);
+  }
+
+  // ── Attachments ──────────────────────────────────────────────────
+
+  /**
+   * Attach a file to a pending decision for the approver to review.
+   *
+   * Accepted types include images, PDFs, common office documents, plain text,
+   * CSV, Markdown, JSON, XML, and RTF. Max 10MB per file, 5 files per decision.
+   *
+   * @returns The full list of attachments now on the decision.
+   */
+  async uploadAttachment(
+    decisionId: string,
+    file: File | Blob,
+    filename?: string,
+  ): Promise<Attachment[]> {
+    const form = new FormData();
+    if (file instanceof File) {
+      form.append('file', file);
+    } else {
+      form.append('file', file, filename || 'upload');
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeout);
+
+    try {
+      const res = await fetch(`${this.baseUrl}/decisions/${decisionId}/attachments`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'User-Agent': 'the-handover-typescript/0.2.0',
+        },
+        body: form,
+        signal: controller.signal,
+      });
+
+      const data = await res.json() as unknown;
+
+      if (!res.ok) {
+        const errorBody = data as ApiErrorBody;
+        throw new HandoverError(
+          `API error ${res.status}: ${errorBody.error || res.statusText}`
+        );
+      }
+
+      return (data as AttachmentsResponse).attachments;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** List attachments currently on a decision. */
+  async listAttachments(decisionId: string): Promise<Attachment[]> {
+    const data = await this.request<AttachmentsResponse>(
+      'GET',
+      `/decisions/${decisionId}/attachments`,
+    );
+    return data.attachments;
   }
 
   /** Get the current state of a decision. */
@@ -165,6 +274,26 @@ export class HandoverClient {
    * ```
    */
   async approve(options: ApproveOptions): Promise<Decision> {
+    const urgency = options.urgency ?? 'medium';
+    if (this.policy !== undefined && !policyRequires(this.policy, options.action, urgency, options.amount)) {
+      return {
+        id: 'auto',
+        action: options.action,
+        context: options.context ?? null,
+        urgency: urgency as Urgency,
+        status: 'approved',
+        options: [],
+        timeout_minutes: options.timeout_minutes ?? 60,
+        response_type: null,
+        response_notes: 'Auto-approved — action did not match any policy rule.',
+        response_data: null,
+        resolved_at: new Date().toISOString(),
+        resolved_by: null,
+        expires_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      };
+    }
+
     const result = await this.create(options);
 
     if (result.auto_resolved) {
