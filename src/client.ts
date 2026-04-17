@@ -191,6 +191,14 @@ export class HandoverClient {
       );
     }
 
+    if (decision.status === 'scheduled' && decision.execute_at) {
+      const executeTime = new Date(decision.execute_at).getTime();
+      const waitMs = executeTime - Date.now();
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+    }
+
     return decision;
   }
 }

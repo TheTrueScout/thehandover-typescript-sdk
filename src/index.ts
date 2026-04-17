@@ -12,6 +12,7 @@ export type {
   NumberInputResponse,
   ConfirmResponse,
   ApproveDenyResponse,
+  ScheduleResponse,
   CreateDecisionOptions,
   CreateDecisionResult,
   ApproveOptions,
