@@ -37,7 +37,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/the-handover/typescript-sdk"
+    "url": "https://github.com/TheTrueScout/thehandover-typescript-sdk"
   },
   "homepage": "https://thehandover.xyz",
   "peerDependencies": {
