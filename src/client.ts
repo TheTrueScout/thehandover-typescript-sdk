@@ -3,11 +3,20 @@ import type {
   CreateDecisionOptions,
   CreateDecisionResult,
   Decision,
+  DecisionStatus,
   ApproveOptions,
   ApprovalPolicy,
   Urgency,
 } from './types.js';
 import { HandoverError, DecisionDenied, DecisionExpired, DecisionTimeout } from './errors.js';
+import { promptDecision, nowIso, devId } from './dev.js';
+
+declare const process:
+  | {
+      env?: Record<string, string | undefined>;
+      stdin?: { isTTY?: boolean };
+    }
+  | undefined;
 
 interface ApiErrorBody {
   error?: string;
@@ -56,7 +65,13 @@ function sleep(ms: number): Promise<void> {
 }
 
 export interface HandoverClientOptions {
-  apiKey: string;
+  /**
+   * API key. Falls back to `process.env.HANDOVER_API_KEY`. If neither is set,
+   * the SDK enters dev mode: decisions are printed to the terminal and the
+   * developer responds on stdin. Dev mode requires a TTY — in web servers or
+   * serverless runtimes you must supply a key.
+   */
+  apiKey?: string;
   baseUrl?: string;
   timeout?: number;
   policy?: ApprovalPolicy;
@@ -85,12 +100,34 @@ export class HandoverClient {
   private baseUrl: string;
   private timeout: number;
   private policy?: ApprovalPolicy;
+  private devMode: boolean;
+  private devDecisions: Map<string, Decision> = new Map();
 
-  constructor(options: HandoverClientOptions) {
-    this.apiKey = options.apiKey;
+  constructor(options: HandoverClientOptions = {}) {
+    const envKey =
+      typeof process !== 'undefined' ? process.env?.HANDOVER_API_KEY : undefined;
+    const apiKey = options.apiKey ?? envKey ?? '';
     this.baseUrl = (options.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.timeout = options.timeout || 30000;
     this.policy = options.policy;
+
+    if (!apiKey) {
+      const hasTty =
+        typeof process !== 'undefined' && Boolean(process.stdin?.isTTY);
+      if (!hasTty) {
+        throw new HandoverError(
+          'No HANDOVER_API_KEY set and no interactive terminal available for ' +
+          'dev mode. Set HANDOVER_API_KEY for production, or run from a ' +
+          'terminal. Get a free key at https://thehandover.xyz/signup',
+        );
+      }
+      this.apiKey = '';
+      this.devMode = true;
+      return;
+    }
+
+    this.apiKey = apiKey;
+    this.devMode = false;
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -103,7 +140,7 @@ export class HandoverClient {
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'the-handover-typescript/0.2.0',
+          'User-Agent': 'the-handover-typescript/0.3.0',
         },
         body: body ? JSON.stringify(body) : undefined,
         signal: controller.signal,
@@ -131,6 +168,7 @@ export class HandoverClient {
    * For most use cases, prefer `approve()` which blocks until resolved.
    */
   async create(options: CreateDecisionOptions): Promise<CreateDecisionResult> {
+    if (this.devMode) return this.devCreate(options);
     const body: Record<string, unknown> = {
       action: options.action,
       approver: options.approver,
@@ -163,6 +201,21 @@ export class HandoverClient {
     file: File | Blob,
     filename?: string,
   ): Promise<Attachment[]> {
+    if (this.devMode) {
+      const name = filename || (file instanceof File ? file.name : 'upload');
+      const attachment: Attachment = {
+        name,
+        url: `dev://local/${name}`,
+        type: file.type || 'application/octet-stream',
+        size: file.size,
+      };
+      const decision = this.devDecisions.get(decisionId);
+      if (decision) {
+        decision.attachments = [...(decision.attachments || []), attachment];
+      }
+      return [attachment];
+    }
+
     const form = new FormData();
     if (file instanceof File) {
       form.append('file', file);
@@ -178,7 +231,7 @@ export class HandoverClient {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
-          'User-Agent': 'the-handover-typescript/0.2.0',
+          'User-Agent': 'the-handover-typescript/0.3.0',
         },
         body: form,
         signal: controller.signal,
@@ -201,6 +254,10 @@ export class HandoverClient {
 
   /** List attachments currently on a decision. */
   async listAttachments(decisionId: string): Promise<Attachment[]> {
+    if (this.devMode) {
+      const decision = this.devDecisions.get(decisionId);
+      return decision ? [...(decision.attachments || [])] : [];
+    }
     const data = await this.request<AttachmentsResponse>(
       'GET',
       `/decisions/${decisionId}/attachments`,
@@ -210,6 +267,11 @@ export class HandoverClient {
 
   /** Get the current state of a decision. */
   async get(decisionId: string): Promise<Decision> {
+    if (this.devMode) {
+      const decision = this.devDecisions.get(decisionId);
+      if (!decision) throw new HandoverError(`Decision ${decisionId} not found (dev mode)`);
+      return decision;
+    }
     return this.request<Decision>('GET', `/decisions/${decisionId}`);
   }
 
@@ -219,6 +281,21 @@ export class HandoverClient {
     action: 'approve' | 'deny' | 'modify',
     options?: { notes?: string; response_data?: Record<string, unknown>; resolved_by?: string },
   ): Promise<Decision> {
+    if (this.devMode) {
+      const decision = this.devDecisions.get(decisionId);
+      if (!decision) throw new HandoverError(`Decision ${decisionId} not found (dev mode)`);
+      const statusMap: Record<string, DecisionStatus> = {
+        approve: 'approved',
+        deny: 'denied',
+        modify: 'modified',
+      };
+      decision.status = statusMap[action] || 'modified';
+      decision.response_notes = options?.notes ?? null;
+      decision.response_data = options?.response_data ?? null;
+      decision.resolved_by = options?.resolved_by ?? 'dev@local';
+      decision.resolved_at = nowIso();
+      return decision;
+    }
     return this.request<Decision>('POST', `/decisions/${decisionId}/resolve`, {
       action,
       ...options,
@@ -248,6 +325,52 @@ export class HandoverClient {
 
       await sleep(Math.min(interval, maxWait - elapsed));
     }
+  }
+
+  // ── Dev mode ─────────────────────────────────────────────────────
+
+  private async devCreate(options: CreateDecisionOptions): Promise<CreateDecisionResult> {
+    const urgency = options.urgency ?? 'medium';
+    const result = await promptDecision({
+      action: options.action,
+      approver: options.approver,
+      urgency,
+      context: options.context,
+      responseType: options.response_type,
+    });
+    const now = nowIso();
+    const id = devId();
+    const decision: Decision = {
+      id,
+      action: options.action,
+      context: options.context ?? null,
+      urgency: urgency as Urgency,
+      status: result.status,
+      options: [],
+      timeout_minutes: options.timeout_minutes ?? 60,
+      response_type: options.response_type ?? null,
+      response_notes: result.notes,
+      response_data: result.responseData,
+      resolved_at: now,
+      resolved_by: 'dev@local',
+      expires_at: now,
+      created_at: now,
+      execute_at: result.executeAt,
+      context_images: options.context_images ?? null,
+      attachments: null,
+      enforce: options.enforce ?? false,
+      action_permitted: options.enforce
+        ? ['approved', 'modified', 'scheduled'].includes(result.status)
+        : undefined,
+    };
+    this.devDecisions.set(id, decision);
+    return {
+      id,
+      status: result.status,
+      expires_at: now,
+      created_at: now,
+      auto_resolved: true,
+    };
   }
 
   // ── High-level enforcement ───────────────────────────────────────
