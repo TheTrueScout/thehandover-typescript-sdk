@@ -69,12 +69,20 @@ export interface HandoverClientOptions {
    * API key. Falls back to `process.env.HANDOVER_API_KEY`. If neither is set,
    * the SDK enters dev mode: decisions are printed to the terminal and the
    * developer responds on stdin. Dev mode requires a TTY — in web servers or
-   * serverless runtimes you must supply a key.
+   * serverless runtimes you must supply a key (or pass `devMode: true`).
    */
   apiKey?: string;
   baseUrl?: string;
   timeout?: number;
   policy?: ApprovalPolicy;
+  /**
+   * When `true`, every decision auto-approves locally with no network call
+   * and no prompt — perfect for CI, unit tests, and local agent runs. When
+   * `false`, the client always hits the API (and throws if no key is set).
+   * When `undefined` (default), the SDK auto-detects dev mode from the
+   * absence of a key and a TTY.
+   */
+  devMode?: boolean;
 }
 
 /**
@@ -101,6 +109,7 @@ export class HandoverClient {
   private timeout: number;
   private policy?: ApprovalPolicy;
   private devMode: boolean;
+  private devAutoApprove: boolean;
   private devDecisions: Map<string, Decision> = new Map();
 
   constructor(options: HandoverClientOptions = {}) {
@@ -110,15 +119,32 @@ export class HandoverClient {
     this.baseUrl = (options.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.timeout = options.timeout || 30000;
     this.policy = options.policy;
+    this.devAutoApprove = options.devMode === true;
+
+    // Explicit devMode: true forces auto-approve, regardless of whether a key
+    // is set. Useful for CI environments where HANDOVER_API_KEY is present but
+    // you don't want the test to actually hit the network.
+    if (options.devMode === true) {
+      this.apiKey = apiKey;
+      this.devMode = true;
+      return;
+    }
 
     if (!apiKey) {
+      if (options.devMode === false) {
+        throw new HandoverError(
+          'No HANDOVER_API_KEY set and devMode=false. Set HANDOVER_API_KEY ' +
+          'or pass devMode: true to test locally.',
+        );
+      }
       const hasTty =
         typeof process !== 'undefined' && Boolean(process.stdin?.isTTY);
       if (!hasTty) {
         throw new HandoverError(
           'No HANDOVER_API_KEY set and no interactive terminal available for ' +
-          'dev mode. Set HANDOVER_API_KEY for production, or run from a ' +
-          'terminal. Get a free key at https://thehandover.xyz/signup',
+          'dev mode. Set HANDOVER_API_KEY for production, pass devMode: true ' +
+          'to auto-approve in tests, or run from a terminal. Get a free key ' +
+          'at https://thehandover.xyz/signup',
         );
       }
       this.apiKey = '';
@@ -140,7 +166,7 @@ export class HandoverClient {
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'the-handover-typescript/0.3.0',
+          'User-Agent': 'the-handover-typescript/0.4.0',
         },
         body: body ? JSON.stringify(body) : undefined,
         signal: controller.signal,
@@ -165,9 +191,18 @@ export class HandoverClient {
 
   /**
    * Create a decision request (non-blocking).
-   * For most use cases, prefer `approve()` which blocks until resolved.
+   *
+   * Returns a typed {@link Decision} populated with both the request fields
+   * (action, urgency, etc.) and the server's response (id, status,
+   * expires_at). For most use cases, prefer {@link approve} which blocks
+   * until the approver responds.
+   *
+   * **Breaking change in 0.4.0** — previously this returned the minimal
+   * `CreateDecisionResult`. If you were doing `result.id`, that still works.
+   * If you stored the result and assumed only those four fields existed, you
+   * may now access the full Decision shape.
    */
-  async create(options: CreateDecisionOptions): Promise<CreateDecisionResult> {
+  async create(options: CreateDecisionOptions): Promise<Decision> {
     if (this.devMode) return this.devCreate(options);
     const body: Record<string, unknown> = {
       action: options.action,
@@ -183,7 +218,31 @@ export class HandoverClient {
     if (options.context_images) body.context_images = options.context_images;
     if (options.enforce) body.enforce = true;
 
-    return this.request<CreateDecisionResult>('POST', '/decisions', body);
+    const created = await this.request<CreateDecisionResult>('POST', '/decisions', body);
+    // Merge the request body and the server response into a Decision. The
+    // server's create endpoint returns a minimal payload; the request body
+    // gives us the rest of the fields without an extra round-trip.
+    return {
+      id: created.id,
+      action: options.action,
+      context: options.context ?? null,
+      urgency: (options.urgency || 'medium') as Urgency,
+      status: created.status as DecisionStatus,
+      options: options.options ?? [],
+      timeout_minutes: options.timeout_minutes || 60,
+      response_type: options.response_type ?? null,
+      response_notes: null,
+      response_data: null,
+      resolved_at: null,
+      resolved_by: null,
+      expires_at: created.expires_at,
+      created_at: created.created_at,
+      execute_at: null,
+      context_images: options.context_images ?? null,
+      attachments: null,
+      enforce: options.enforce ?? false,
+      action_permitted: undefined,
+    };
   }
 
   // ── Attachments ──────────────────────────────────────────────────
@@ -231,7 +290,7 @@ export class HandoverClient {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
-          'User-Agent': 'the-handover-typescript/0.3.0',
+          'User-Agent': 'the-handover-typescript/0.4.0',
         },
         body: form,
         signal: controller.signal,
@@ -329,15 +388,33 @@ export class HandoverClient {
 
   // ── Dev mode ─────────────────────────────────────────────────────
 
-  private async devCreate(options: CreateDecisionOptions): Promise<CreateDecisionResult> {
+  private async devCreate(options: CreateDecisionOptions): Promise<Decision> {
     const urgency = options.urgency ?? 'medium';
-    const result = await promptDecision({
-      action: options.action,
-      approver: options.approver,
-      urgency,
-      context: options.context,
-      responseType: options.response_type,
-    });
+    let status: DecisionStatus;
+    let notes: string | null;
+    let responseData: Record<string, unknown> | null;
+    let executeAt: string | null;
+
+    if (this.devAutoApprove) {
+      // Silent auto-approve; no prompt, no network call. For CI/tests.
+      status = 'approved' as DecisionStatus;
+      notes = 'auto-approved (devMode: true)';
+      responseData = null;
+      executeAt = null;
+    } else {
+      const result = await promptDecision({
+        action: options.action,
+        approver: options.approver,
+        urgency,
+        context: options.context,
+        responseType: options.response_type,
+      });
+      status = result.status;
+      notes = result.notes;
+      responseData = result.responseData;
+      executeAt = result.executeAt;
+    }
+
     const now = nowIso();
     const id = devId();
     const decision: Decision = {
@@ -345,32 +422,26 @@ export class HandoverClient {
       action: options.action,
       context: options.context ?? null,
       urgency: urgency as Urgency,
-      status: result.status,
+      status,
       options: [],
       timeout_minutes: options.timeout_minutes ?? 60,
       response_type: options.response_type ?? null,
-      response_notes: result.notes,
-      response_data: result.responseData,
+      response_notes: notes,
+      response_data: responseData,
       resolved_at: now,
       resolved_by: 'dev@local',
       expires_at: now,
       created_at: now,
-      execute_at: result.executeAt,
+      execute_at: executeAt,
       context_images: options.context_images ?? null,
       attachments: null,
       enforce: options.enforce ?? false,
       action_permitted: options.enforce
-        ? ['approved', 'modified', 'scheduled'].includes(result.status)
+        ? ['approved', 'modified', 'scheduled'].includes(status)
         : undefined,
     };
     this.devDecisions.set(id, decision);
-    return {
-      id,
-      status: result.status,
-      expires_at: now,
-      created_at: now,
-      auto_resolved: true,
-    };
+    return decision;
   }
 
   // ── High-level enforcement ───────────────────────────────────────
@@ -419,7 +490,10 @@ export class HandoverClient {
 
     const result = await this.create(options);
 
-    if (result.auto_resolved) {
+    // Server-side policy or auto-action rules can resolve a decision
+    // synchronously — no need to poll. Re-read the full record so any
+    // server-set fields (response_notes, resolved_at, etc.) are present.
+    if (result.status !== 'pending') {
       return this.get(result.id);
     }
 
