@@ -144,7 +144,7 @@ export class HandoverClient {
           'No HANDOVER_API_KEY set and no interactive terminal available for ' +
           'dev mode. Set HANDOVER_API_KEY for production, pass devMode: true ' +
           'to auto-approve in tests, or run from a terminal. Get a free key ' +
-          'at https://thehandover.xyz/signup',
+          'at https://thehandover.xyz/dashboard',
         );
       }
       this.apiKey = '';
